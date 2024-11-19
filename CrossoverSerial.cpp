@@ -1,108 +1,219 @@
+#define USE_ARM_DSP
+#include "daisy_pod.h"
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "../desktopProgrammer/CrossoverProtocol.h"
+#include "iir.h"
 #include <string.h>
+#include <cmath>
 
 using namespace daisy;
 using namespace daisysp;
 
-static DaisySeed hw;
+static DaisyPod hw;
+static DaisySeed seed;
 
 // Device identification
 static constexpr char DEVICE_NAME[] = "DAISY_CROSSOVER";
-static constexpr uint32_t DEVICE_ID = 0x12345678;
+static constexpr uint32_t DEVICE_ID = 0x69696969;
 
 // Buffer for incoming serial data
 static uint8_t serialBuffer[Protocol::MAX_MESSAGE_SIZE];
 static size_t serialBufferIndex = 0;
 
-// Filter objects
-static Svf parametricEQ_left[8];
-static Svf parametricEQ_right[8];
-static Svf highpass_left;
-static Svf highpass_right;
-static Svf lowpass_left;
-static Svf lowpass_right;
+// IIR filter objects - one per channel
+static IIR<IIRFILTER_USER_MEMORY> filter_left;
+static IIR<IIRFILTER_USER_MEMORY> filter_right;
+
+// State buffers - 4 states per stage, up to 16 stages
+static float filter_states_left[64];  // 16 stages * 4 states
+static float filter_states_right[64]; // 16 stages * 4 states
+
+// Coefficients buffer - 5 coeffs per stage, up to 16 stages
+static float filter_coeffs[80];       // 16 stages * 5 coefficients
 
 // Current filter settings
-static Protocol::FilterParameters eqParams[8];
-static Protocol::HighpassFilter hpfParams;
-static Protocol::LowpassFilter lpfParams;
+static Protocol::FilterParameters filterParams[16];
+static uint8_t numActiveFilters = 0;
+
+// Settings struct for persistent storage
+struct Settings {
+    Protocol::FilterParameters filterParams[16];
+    uint8_t numActiveFilters;
+
+    bool operator!=(const Settings& a) const {
+        if (a.numActiveFilters != numActiveFilters) return true;
+        for(int i = 0; i < numActiveFilters; i++) {
+            if(a.filterParams[i].enabled != filterParams[i].enabled ||
+               a.filterParams[i].frequency != filterParams[i].frequency ||
+               a.filterParams[i].q != filterParams[i].q ||
+               a.filterParams[i].gain != filterParams[i].gain ||
+               a.filterParams[i].type != filterParams[i].type) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// Persistent Storage Declaration
+static PersistentStorage<Settings> storage(hw.seed.qspi);
+
+// Convert float to Q29 format with postshift of 2
+int32_t floatToQ29(float value) {
+    return static_cast<int32_t>(value * (1 << 29) * (1 << 2));
+}
+
+void CalculateFilterCoefficients(const Protocol::FilterParameters& params, float sampleRate, float* coeffs) {
+    float w0 = 2.0f * M_PI * params.frequency / sampleRate;
+    float alpha = sinf(w0) / (2.0f * params.q);
+    float A = powf(10.0f, params.gain / 40.0f);
+    float cos_w0 = cosf(w0);
+    float a0 = 1.0f;
+    
+    // Initialize coefficients with default values
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+
+    switch (params.type) {
+        case Protocol::FilterType::PeakingEQ:
+            b0 = 1.0f + alpha * A;
+            b1 = -2.0f * cos_w0;
+            b2 = 1.0f - alpha * A;
+            a0 = 1.0f + alpha / A;
+            a1 = -2.0f * cos_w0;
+            a2 = 1.0f - alpha / A;
+            break;
+
+        case Protocol::FilterType::LowShelf:
+            {
+                float sqrtA = sqrtf(A);
+                a0 = (A + 1.0f) + (A - 1.0f) * cos_w0 + 2.0f * sqrtA * alpha;
+                b0 = A * ((A + 1.0f) - (A - 1.0f) * cos_w0 + 2.0f * sqrtA * alpha);
+                b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cos_w0);
+                b2 = A * ((A + 1.0f) - (A - 1.0f) * cos_w0 - 2.0f * sqrtA * alpha);
+                a1 = -2.0f * ((A - 1.0f) + (A + 1.0f) * cos_w0);
+                a2 = (A + 1.0f) + (A - 1.0f) * cos_w0 - 2.0f * sqrtA * alpha;
+            }
+            break;
+
+        case Protocol::FilterType::HighShelf:
+            {
+                float sqrtA = sqrtf(A);
+                a0 = (A + 1.0f) - (A - 1.0f) * cos_w0 + 2.0f * sqrtA * alpha;
+                b0 = A * ((A + 1.0f) + (A - 1.0f) * cos_w0 + 2.0f * sqrtA * alpha);
+                b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cos_w0);
+                b2 = A * ((A + 1.0f) + (A - 1.0f) * cos_w0 - 2.0f * sqrtA * alpha);
+                a1 = 2.0f * ((A - 1.0f) - (A + 1.0f) * cos_w0);
+                a2 = (A + 1.0f) - (A - 1.0f) * cos_w0 - 2.0f * sqrtA * alpha;
+            }
+            break;
+
+        case Protocol::FilterType::HighPass:
+            a0 = 1.0f + alpha;
+            b0 = (1.0f + cos_w0) / 2.0f;
+            b1 = -(1.0f + cos_w0);
+            b2 = (1.0f + cos_w0) / 2.0f;
+            a1 = -2.0f * cos_w0;
+            a2 = 1.0f - alpha;
+            break;
+
+        case Protocol::FilterType::LowPass:
+            a0 = 1.0f + alpha;
+            b0 = (1.0f - cos_w0) / 2.0f;
+            b1 = 1.0f - cos_w0;
+            b2 = (1.0f - cos_w0) / 2.0f;
+            a1 = -2.0f * cos_w0;
+            a2 = 1.0f - alpha;
+            break;
+    }
+
+    // Normalize by a0
+    coeffs[0] = static_cast<float>(b0 / a0);  // b0
+    coeffs[1] = static_cast<float>(b1 / a0);  // b1
+    coeffs[2] = static_cast<float>(b2 / a0);  // b2
+    coeffs[3] = static_cast<float>(-a1 / a0); // -a1
+    coeffs[4] = static_cast<float>(-a2 / a0); // -a2
+}
 
 void InitializeFilters() {
-    float sample_rate = hw.AudioSampleRate();
-    for (int i = 0; i < 8; i++) {
-        parametricEQ_left[i].Init(sample_rate);
-        parametricEQ_right[i].Init(sample_rate);
-    }
-    highpass_left.Init(sample_rate);
-    highpass_right.Init(sample_rate);
-    lowpass_left.Init(sample_rate);
-    lowpass_right.Init(sample_rate);
+    // Initialize one filter per channel with state buffers large enough for all stages
+    filter_left.SetStateBuffer(filter_states_left, 64);
+    filter_right.SetStateBuffer(filter_states_right, 64);
+    
+    // Reset filters to ensure clean state
+    filter_left.Reset();
+    filter_right.Reset();
 }
 
-void UpdateFilters() {
-    for (int i = 0; i < 8; i++) {
-        if (eqParams[i].enabled) {
-            parametricEQ_left[i].SetFreq(eqParams[i].frequency);
-            parametricEQ_left[i].SetRes(1.0f / eqParams[i].q);
-            parametricEQ_right[i].SetFreq(eqParams[i].frequency);
-            parametricEQ_right[i].SetRes(1.0f / eqParams[i].q);
+bool UpdateFilters() {
+    float sample_rate = hw.AudioSampleRate();
+    uint8_t activeStages = 0;
+    
+    // Reset filters first to ensure clean state
+    filter_left.Reset();
+    filter_right.Reset();
+    
+    // If no active filters, just return true (passthrough mode)
+    if (numActiveFilters == 0) {
+        return true;
+    }
+    
+    // Validate numActiveFilters
+    if (numActiveFilters > 16) {
+        numActiveFilters = 16;  // Safety clamp
+    }
+    
+    // Calculate coefficients for each active filter
+    for (int i = 0; i < numActiveFilters && activeStages < 16; i++) {
+        if (filterParams[i].enabled) {
+            CalculateFilterCoefficients(filterParams[i], sample_rate, &filter_coeffs[activeStages * 5]);
+            activeStages++;
         }
     }
-
-    if (hpfParams.enabled) {
-        highpass_left.SetFreq(hpfParams.frequency);
-        highpass_left.SetRes(1.0f / hpfParams.q);
-        highpass_right.SetFreq(hpfParams.frequency);
-        highpass_right.SetRes(1.0f / hpfParams.q);
+    
+    // Only initialize the ARM DSP biquad filter if we have active stages
+    if (activeStages > 0) {
+        bool left_success = filter_left.SetIIR(filter_coeffs, activeStages);
+        bool right_success = filter_right.SetIIR(filter_coeffs, activeStages);
+        return left_success && right_success;
     }
+    
+    return true;
+}
 
-    if (lpfParams.enabled) {
-        lowpass_left.SetFreq(lpfParams.frequency);
-        lowpass_left.SetRes(1.0f / lpfParams.q);
-        lowpass_right.SetFreq(lpfParams.frequency);
-        lowpass_right.SetRes(1.0f / lpfParams.q);
+void LoadSettings() {
+    Settings& stored = storage.GetSettings();
+    memcpy(filterParams, stored.filterParams, sizeof(filterParams));
+    numActiveFilters = stored.numActiveFilters;
+    
+    // Ensure filters are in a known state before updating
+    filter_left.Reset();
+    filter_right.Reset();
+    
+    if (!UpdateFilters()) {
+        // If filter update fails, reset to default state
+        numActiveFilters = 0;
+        memset(filterParams, 0, sizeof(filterParams));
+        UpdateFilters();
     }
 }
 
-float ApplyGain(float input, float gainDB) {
-    return input * powf(10.0f, gainDB / 20.0f);
+void SaveSettings() {
+    Settings& stored = storage.GetSettings();
+    memcpy(stored.filterParams, filterParams, sizeof(filterParams));
+    stored.numActiveFilters = numActiveFilters;
+    storage.Save();
 }
 
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
 {
-    for (size_t i = 0; i < size; i++)
-    {
-        float left = in[0][i];
-        float right = in[1][i];
-
-        // Apply filters
-        if (hpfParams.enabled) {
-            highpass_left.Process(left);
-            left = highpass_left.High();
-            highpass_right.Process(right);
-            right = highpass_right.High();
-        }
-
-        for (int j = 0; j < 8; j++) {
-            if (eqParams[j].enabled) {
-                parametricEQ_left[j].Process(left);
-                left = ApplyGain(parametricEQ_left[j].Peak(), eqParams[j].gain);
-                parametricEQ_right[j].Process(right);
-                right = ApplyGain(parametricEQ_right[j].Peak(), eqParams[j].gain);
-            }
-        }
-
-        if (lpfParams.enabled) {
-            lowpass_left.Process(left);
-            left = lowpass_left.Low();
-            lowpass_right.Process(right);
-            right = lowpass_right.Low();
-        }
-
-        out[0][i] = left;
-        out[1][i] = right;
+    if (numActiveFilters > 0) {
+        filter_left.ProcessBlock(const_cast<float*>(in[0]), out[0], size);
+        filter_right.ProcessBlock(const_cast<float*>(in[1]), out[1], size);
+    } else {
+        // Direct passthrough when no filters are active
+        memcpy(out[0], in[0], size * sizeof(float));
+        memcpy(out[1], in[1], size * sizeof(float));
     }
 }
 
@@ -113,7 +224,7 @@ void SendMessage(Protocol::MessageType type, const void* payload, uint16_t paylo
     
     // Prepare header
     Protocol::MessageHeader* header = reinterpret_cast<Protocol::MessageHeader*>(buffer);
-    header->startMarker1 = 0xAA;  // Explicitly set start markers
+    header->startMarker1 = 0xAA;
     header->startMarker2 = 0x55;
     header->protocolVersion = Protocol::PROTOCOL_VERSION;
     header->type = type;
@@ -146,7 +257,7 @@ void SendMessage(Protocol::MessageType type, const void* payload, uint16_t paylo
     footer->endMarker2 = 0xAA;
     
     // Send message
-    hw.usb_handle.TransmitInternal(buffer, messageSize);
+    hw.seed.usb_handle.TransmitInternal(buffer, messageSize);
 }
 
 void ProcessMessage(const Protocol::MessageHeader* header, const uint8_t* payload)
@@ -198,13 +309,27 @@ void ProcessMessage(const Protocol::MessageHeader* header, const uint8_t* payloa
             const Protocol::FilterParametersPayload* params = 
                 reinterpret_cast<const Protocol::FilterParametersPayload*>(payload);
 
-            // Update filter parameters
-            memcpy(eqParams, params->bands, sizeof(eqParams));
-            memcpy(&hpfParams, &params->hpf, sizeof(hpfParams));
-            memcpy(&lpfParams, &params->lpf, sizeof(lpfParams));
+            // Update number of active filters and their parameters
+            numActiveFilters = params->numBands;
+            if (numActiveFilters > 16) numActiveFilters = 16;  // Safety check
+            
+            memcpy(filterParams, params->bands, numActiveFilters * sizeof(Protocol::FilterParameters));
 
             // Update filters
-            UpdateFilters();
+            if (!UpdateFilters()) {
+                Protocol::ErrorMessage error;
+                error.code = Protocol::ErrorCode::INVALID_FILTER_PARAMS;
+                strcpy(error.message, "Failed to update filters");
+                SendMessage(Protocol::MessageType::ERROR, &error, sizeof(error));
+                // Reset filters and set passthrough mode
+                numActiveFilters = 0;
+                memset(filterParams, 0, sizeof(filterParams));
+                UpdateFilters();
+                break;
+            }
+
+            // Save new parameters to flash
+            SaveSettings();
 
             // Send acknowledgment
             SendMessage(Protocol::MessageType::ACKNOWLEDGMENT, nullptr, 0);
@@ -292,20 +417,29 @@ void UsbCallback(uint8_t* buf, uint32_t* len)
 int main(void)
 {
     // Initialize hardware
-    hw.Configure();
     hw.Init();
     hw.SetAudioBlockSize(4); // number of samples handled per callback
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
-    hw.StartAudio(AudioCallback);
 
+    // Initialize persistent storage with default values first
+    Settings defaultSettings = {};  // Zero-initialize all fields
+    storage.Init(defaultSettings);
+
+    // Initialize filters after storage but before loading settings
     InitializeFilters();
 
+    // Load saved settings if they exist
+    LoadSettings();
+
+    // Start audio after all initialization is complete
+    hw.StartAudio(AudioCallback);
+
     // Initialize USB
-    hw.usb_handle.Init(UsbHandle::FS_BOTH);
-    hw.usb_handle.SetReceiveCallback(UsbCallback, UsbHandle::FS_BOTH);
+    hw.seed.usb_handle.Init(UsbHandle::FS_BOTH);
+    hw.seed.usb_handle.SetReceiveCallback(UsbCallback, UsbHandle::FS_BOTH);
 
     // Turn on LED to indicate we're ready
-    hw.SetLed(true);
+    hw.seed.SetLed(true);
     
     while(1)
     {
