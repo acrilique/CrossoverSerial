@@ -15,7 +15,7 @@ static DaisySeed seed;
 
 // Device identification
 static constexpr char DEVICE_NAME[] = "DAISY_CROSSOVER";
-static constexpr uint32_t DEVICE_ID = 0x69696969;
+static constexpr uint32_t DEVICE_ID = 0;
 
 // Buffer for incoming serial data
 static uint8_t serialBuffer[Protocol::MAX_MESSAGE_SIZE];
@@ -58,11 +58,6 @@ struct Settings {
 
 // Persistent Storage Declaration
 static PersistentStorage<Settings> storage(hw.seed.qspi);
-
-// Convert float to Q29 format with postshift of 2
-int32_t floatToQ29(float value) {
-    return static_cast<int32_t>(value * (1 << 29) * (1 << 2));
-}
 
 void CalculateFilterCoefficients(const Protocol::FilterParameters& params, float sampleRate, float* coeffs) {
     float w0 = 2.0f * M_PI * params.frequency / sampleRate;
@@ -109,30 +104,31 @@ void CalculateFilterCoefficients(const Protocol::FilterParameters& params, float
             break;
 
         case Protocol::FilterType::HighPass:
-            a0 = 1.0f + alpha;
             b0 = (1.0f + cos_w0) / 2.0f;
             b1 = -(1.0f + cos_w0);
             b2 = (1.0f + cos_w0) / 2.0f;
+            a0 = 1.0f + alpha;
             a1 = -2.0f * cos_w0;
             a2 = 1.0f - alpha;
             break;
 
         case Protocol::FilterType::LowPass:
-            a0 = 1.0f + alpha;
             b0 = (1.0f - cos_w0) / 2.0f;
             b1 = 1.0f - cos_w0;
             b2 = (1.0f - cos_w0) / 2.0f;
+            a0 = 1.0f + alpha;
             a1 = -2.0f * cos_w0;
             a2 = 1.0f - alpha;
             break;
     }
 
-    // Normalize by a0
-    coeffs[0] = static_cast<float>(b0 / a0);  // b0
-    coeffs[1] = static_cast<float>(b1 / a0);  // b1
-    coeffs[2] = static_cast<float>(b2 / a0);  // b2
-    coeffs[3] = static_cast<float>(-a1 / a0); // -a1
-    coeffs[4] = static_cast<float>(-a2 / a0); // -a2
+    // Normalize coefficients by a0 and store in ARM CMSIS DSP biquad format
+    // [b0/a0, b1/a0, b2/a0, -a1/a0, -a2/a0]
+    coeffs[0] = b0 / a0;
+    coeffs[1] = b1 / a0;
+    coeffs[2] = b2 / a0;
+    coeffs[3] = -a1 / a0;
+    coeffs[4] = -a2 / a0;
 }
 
 void InitializeFilters() {
@@ -435,8 +431,8 @@ int main(void)
     hw.StartAudio(AudioCallback);
 
     // Initialize USB
-    hw.seed.usb_handle.Init(UsbHandle::FS_BOTH);
-    hw.seed.usb_handle.SetReceiveCallback(UsbCallback, UsbHandle::FS_BOTH);
+    hw.seed.usb_handle.Init(UsbHandle::FS_INTERNAL);
+    hw.seed.usb_handle.SetReceiveCallback(UsbCallback, UsbHandle::FS_INTERNAL);
 
     // Turn on LED to indicate we're ready
     hw.seed.SetLed(true);
